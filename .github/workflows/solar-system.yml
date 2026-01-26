@@ -1,4 +1,4 @@
-name: CD 
+name: Solar System Workflow
 
 on:
   workflow_dispatch:
@@ -11,6 +11,8 @@ on:
 env:
   MONGO_USERNAME: ${{ vars.MONGO_USERNAME }}
   MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
+  # لو عندك Mongo URI كـ Secret (مفضل)
+  MONGO_URI: ${{ secrets.MONGO_URI }}
 
 jobs:
   # 1) Unit Testing (Runs on VM + Mongo Service Container) => لازم Port Mapping + localhost
@@ -29,7 +31,7 @@ jobs:
       matrix:
         nodejs_version: [18, 20]
 
-    # هنا بنعمل Override للـ MONGO_URI علشان يبقى Local Container مش Production
+    # Override للـ DB علشان تبقى local service container
     env:
       MONGO_URI: "mongodb://localhost:27017/superData"
       MONGO_USERNAME: "non-prod-user"
@@ -58,17 +60,14 @@ jobs:
     needs: unit-testing
     runs-on: ubuntu-latest
 
-    # Job Container: كل Steps هتشتغل جوه container فيه Node جاهز
     container:
       image: node:18
 
-    # Service Container جنب الـ Job Container على نفس Docker Network
     services:
       mongo-db:
         image: siddharth67/mongo-db:non-prod
         options: --name mongo
 
-    # هنا مفيش localhost لأننا جوه container، فبنستخدم اسم الخدمة/الكونتينر: mongo
     env:
       MONGO_URI: "mongodb://mongo:27017/superData"
       MONGO_USERNAME: "non-prod-user"
@@ -85,7 +84,7 @@ jobs:
         run: npm run coverage
 
 
-  # 3) Docker Build/Test/Push (DockerHub + GHCR)
+  # 3) Docker Build/Test/Push (DockerHub ONLY)
   docker:
     name: Containerization (Build/Test/Push)
     needs: [unit-testing, code-coverage]
@@ -93,26 +92,17 @@ jobs:
 
     permissions:
       contents: read
-      packages: write
 
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
 
-      # Login DockerHub
+      # DockerHub Login (لازم يكون DOCKERHUB_USERNAME variable + DOCKERHUB_PASSWORD secret)
       - name: Docker Hub Login
-        uses: docker/login-action@v2.2.0
+        uses: docker/login-action@v2
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
-
-      # Login GHCR (بيستخدم GitHub Token)
-      - name: GHCR Login
-        uses: docker/login-action@v2.2.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       # Build image locally for testing (بدون Push)
       - name: Docker Build for Testing
@@ -143,15 +133,14 @@ jobs:
           docker logs --tail=50 solar-system-app || true
           docker rm -f solar-system-app || true
 
-      # Push to DockerHub + GHCR (نفس ال SHA tag)
-      - name: Push to DockerHub and GHCR
+      # Push to DockerHub (نفس ال SHA tag)
+      - name: Push to DockerHub
         uses: docker/build-push-action@v4
         with:
           context: .
           push: true
           tags: |
             ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha }}
-            ghcr.io/${{ github.repository_owner }}/solar-system:${{ github.sha }}
 
 
   # 4) Dev Deploy (Install kubectl + kubeconfig + apply manifests + integration test)
@@ -169,7 +158,6 @@ jobs:
         with:
           version: "v1.26.0"
 
-      # kubeconfig معمول base64 ومتحطوط في Secret اسمه KUBECONFIG_DATA
       - name: Configure kubeconfig
         run: |
           mkdir -p ~/.kube
@@ -181,19 +169,15 @@ jobs:
           echo "------------------------------"
           kubectl get nodes
 
-      # (اختياري) نبدل ال image في الـ manifest بالـ sha الجديد قبل apply
-      # لازم يكون عندك في k8s/dev/deployment.yaml قيمة image يمكن تبديلها
       - name: Deploy to Dev Namespace
         run: |
-          # لو عندك namespace dev
           kubectl get ns dev || kubectl create ns dev
 
-          # مثال: لو deployment عندك اسمه solar-system و container name app
+          # استخدم DockerHub image بدل GHCR
           kubectl -n dev set image deployment/solar-system \
-            app=ghcr.io/${{ github.repository_owner }}/solar-system:${{ github.sha }} \
+            app=${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha }} \
             --record || true
 
-          # أو لو بتطبقي manifests مباشرة
           kubectl apply -n dev -f k8s/dev/
 
           kubectl -n dev rollout status deployment/solar-system --timeout=180s
@@ -201,7 +185,6 @@ jobs:
 
       - name: Integration Test (Dev)
         run: |
-          # حطي رابط الانجرس بتاع الديف في Variable اسمها DEV_URL
           echo "Testing Dev URL: ${{ vars.DEV_URL }}"
           wget -qO- "${{ vars.DEV_URL }}/live" | grep live
 
@@ -212,7 +195,6 @@ jobs:
     needs: dev-deploy
     runs-on: ubuntu-latest
 
-    # اعملي Environment اسمها production وخليها Required reviewers عشان تبقى Manual Approval
     environment: production
 
     steps:
@@ -233,8 +215,9 @@ jobs:
         run: |
           kubectl get ns prod || kubectl create ns prod
 
+          # استخدم DockerHub image بدل GHCR
           kubectl -n prod set image deployment/solar-system \
-            app=ghcr.io/${{ github.repository_owner }}/solar-system:${{ github.sha }} \
+            app=${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha }} \
             --record || true
 
           kubectl apply -n prod -f k8s/prod/
@@ -244,6 +227,5 @@ jobs:
 
       - name: Integration Test (Prod)
         run: |
-          # حطي رابط الانجرس بتاع البرود في Variable اسمها PROD_URL
           echo "Testing Prod URL: ${{ vars.PROD_URL }}"
           wget -qO- "${{ vars.PROD_URL }}/live" | grep live
